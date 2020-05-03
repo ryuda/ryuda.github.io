@@ -1,11 +1,51 @@
 ---
-title: About
-
-# The About page
-# v2.0
-# https://github.com/cotes2020/jekyll-theme-chirpy
-# © 2017-2019 Cotes Chung
-# MIT License
+title: About Me
 ---
+## [인적]
+이 름 : 류재경
 
-> **Note**: Add Markdown syntax content to file `tabs/about.md` and it will show up on this page.
+생년월일 : 1984년 이른 봄에 태어남 
+
+이메일 : ryuda@nate.com
+
+
+## [학력]
+국가평생교육진흥원 학점은행 정보 보호 학사 취득 2005년 02월
+
+한국 IT 전문학교 컴퓨터 보안과 졸업 2004년 02월
+
+동남 고등학교 정보처리과 졸업 2002년 02월
+
+
+## [경력]
+**가장 최근의 프로젝트를 상단으로 표시하였습니다.
+
+챗봇 대외사업 전환 프로젝트 2020년 3월 ~ 2020년 4월
+* 챗봇 시스템 로그인 및 회원관리(admin) 화면 구현
+
+ 
+
+
+
+
+## [수강 이력]
+React SNS 만들기 2020/02 ~ 2020/03 인프런
+
+Flex 단기과정   2008/02 ~ 2008/03 IBI 국제비즈니스 교육원
+
+C-Language    2006/01 ~ 2006/03 아이티뱅크 멀티캠퍼스
+
+
+
+
+
+(`.PNG` and `.ICO`) 그래서 나옴 
+
+하지만  이렇게 줄바 꿈을 할려면 한줄을 비워줘야 한다
+
+개발자들이 개발을 자하는 이유가 있다 그것은 글을 잘쓰기 때문이다
+
+## [경력]
+
+
+

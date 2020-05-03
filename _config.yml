@@ -21,7 +21,7 @@ description: >-                        # used by seo meta and the atom feed
 # Replace with the website url, e.g. 'https://username.github.io'
 url: 'https://ryuda.github.io'
 
-author: Ryu Jae Kyoung                  # change to your full name
+author: Ryuda                  # change to your full name
 
 avatar: /assets/img/sample/avatar.jpg   # support internet resources
 
@@ -32,7 +32,7 @@ twitter:
   username: ryuda            # change to your twitter username
 
 social:
-  name: Ryu Jae Kyoung                  # it will shows as the copyright owner in Footer
+  name: Ryuda                  # it will shows as the copyright owner in Footer
   email: ryuda@nate.com             # change to your email address
   links:
     # The first element serves as the copyright owner's link
@@ -79,7 +79,7 @@ disqus:
 #
 #     dark   - Use the dark color scheme
 #
-theme_mode: dual
+theme_mode: light
 
 # boolean type, global switch for ToC in posts.
 toc: true
