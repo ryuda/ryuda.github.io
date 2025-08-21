@@ -1,31 +1,43 @@
-import { useState } from "react";
-import { png2svg } from "svg-png-converter";
+import { useState, useEffect } from "react";
 
-export default function PngToSvgConverter() {
-  const [svg, setSvg] = useState("");
+const TypingEffect = () => {
+  const [text, setText] = useState("");
+  const fullText = "여기에 타이핑 될 문장을 넣으세요!";
+  const [start, setStart] = useState(false);
 
-  const handleFile = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+  useEffect(() => {
+    if (!start) return;
 
-    const arrayBuffer = await file.arrayBuffer();
-    const svgData = await png2svg({
-      input: new Uint8Array(arrayBuffer),
-      trace: true, // 벡터화 활성화
-    });
+    let i = 0;
+    const interval = setInterval(() => {
+      setText((prev) => prev + fullText[i]);
+      i++;
+      if (i >= fullText.length) {
+        clearInterval(interval);
+      }
+    }, 100); // 글자 나오는 속도(ms)
 
-    setSvg(svgData);
-  };
+    return () => clearInterval(interval);
+  }, [start]);
+
+  useEffect(() => {
+    // body 클릭 이벤트 등록
+    const handleClick = () => {
+      setText(""); // 다시 시작할 때 초기화 (원하면 제거 가능)
+      setStart(true);
+    };
+    document.body.addEventListener("click", handleClick);
+
+    return () => {
+      document.body.removeEventListener("click", handleClick);
+    };
+  }, []);
 
   return (
-    <div>
-      <input type="file" accept="image/png" onChange={handleFile} />
-      {svg && (
-        <div
-          style={{ border: "1px solid #ccc", marginTop: "10px" }}
-          dangerouslySetInnerHTML={{ __html: svg }}
-        />
-      )}
+    <div className="flex items-center justify-center h-screen bg-gray-900">
+      <p className="text-white text-2xl font-mono whitespace-pre">{text}</p>
     </div>
   );
-}
+};
+
+export default TypingEffect;
