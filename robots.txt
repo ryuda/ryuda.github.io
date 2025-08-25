@@ -1,25 +1,26 @@
 // tools/scan-apis.mjs
-// Spring 전용: 엔드포인트 스캔 + version(v1/v2) + Swagger @Operation.description + Request/POST Response 바디 생성
-// - description: @Operation(description="...")만 사용  // CHANGED
-// - RequestBody: @RequestBody 타입의 DTO/Model 파일 내용으로만 생성
-// - POST ResponseBody: @RequestBody의 DTO를 그대로 사용해 생성  // CHANGED
+// Spring(Java 중심) 엔드포인트 스캐너
+// - @RestController / @Controller + @RequestMapping / @*Mapping 탐지
+// - description: @Operation.description ⇒ 메서드 위 /** ... */의 "description:" ⇒ 클래스 @Tag.description
+// - version: 경로 선두 v1/v2/... 추출
+// - RequestBody 관련 정보는 출력하지 않음
+// - 결과: 프로젝트 루트에 .api-scan.json 저장
 
 import fs from 'fs';
 import path from 'path';
 
 const root = process.cwd();
-const SRC_DIRS = ['src', 'src/main/java', 'src/main/kotlin'];
-const TARGET_EXTS = new Set(['.java', '.kt']);
-const MAX_DEPTH = 3;
+const SRC_DIRS = ['src', 'src/main/java']; // 필요하면 'src/main/kotlin' 추가
+const TARGET_EXTS = new Set(['.java']);     // Java 위주. Kotlin 쓰면 '.kt'도 추가
 
-// ---------- utils ----------
+// ---------- 공통 유틸 ----------
+const readText = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 const normPath = (p) => (p || '').replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+const indexToLine = (text, idx) => text.slice(0, idx).split('\n').length;
 const extractVersion = (p) => {
   const m = /^\/?(v\d+)\b/i.exec(p || '');
   return m ? m[1].toLowerCase() : null;
 };
-const readText = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
-const indexToLine = (text, idx) => text.slice(0, idx).split('\n').length;
 
 const walk = (dir, out = []) => {
   if (!fs.existsSync(dir)) return out;
@@ -35,329 +36,125 @@ const walk = (dir, out = []) => {
   return out;
 };
 
-// ---------- primitive helpers ----------
-const primitiveSample = (t) => {
-  const s = (t || '').toLowerCase();
-  if (/(^|[\W_])(int|long|double|float|number|bigdecimal)([\W_]|$)/.test(s)) return 0;
-  if (/bool|boolean/.test(s)) return true;
-  if (/date|localdate|localdatetime|instant|zoneddatetime|offsetdatetime/.test(s)) return '2025-01-01T00:00:00Z';
-  if (/uuid/.test(s)) return '00000000-0000-0000-0000-000000000000';
-  if (/byte\[\]|bytes/.test(s)) return '';
-  if (/string|char|text/i.test(s)) return 'string';
-  return 'string';
+// ---------- description 추출 ----------
+// 1) 메서드 주변 @Operation(description="...")
+const findOperationDescription = (text, idx) => {
+  const around = text.slice(Math.max(0, idx - 2000), idx + 2000);
+  const m = around.match(/@Operation\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
+  return m ? (m[1] || '').trim() : '';
 };
-const primitiveFormat = (t) => {
-  const s = (t || '').toLowerCase();
-  if (/uuid/.test(s)) return 'uuid';
-  if (/date|time|instant|zoneddatetime|offsetdatetime/i.test(s)) return 'date-time';
-  if (/email/.test(s)) return 'email';
-  return undefined;
+
+// 2) 매핑 직전 /** ... */ 블록에서 swagger 스타일 "description:" 찾아보기
+const findNearestBlockDescription = (text, idx) => {
+  // idx 이전의 가장 가까운 /** ... */ 블록
+  const before = text.slice(0, idx);
+  const start = before.lastIndexOf('/**');
+  if (start === -1) return '';
+  const end = before.indexOf('*/', start + 3);
+  if (end === -1) return '';
+  const block = before.slice(start, end + 2);
+
+  // 블록 내부에서 yaml 스타일 description: "..."
+  // (큰따옴표/작은따옴표 모두, 멀티라인은 간단 처리)
+  const m1 = block.match(/description\s*:\s*"(.*?)"/s);
+  if (m1) return (m1[1] || '').trim();
+  const m2 = block.match(/description\s*:\s*'(.*?)'/s);
+  if (m2) return (m2[1] || '').trim();
+
+  // 혹시 줄 끝 주석형: description: 텍스트
+  const m3 = block.match(/description\s*:\s*(.+)\n/);
+  if (m3) return (m3[1] || '').trim();
+
+  return '';
 };
-const stripPkg = (t) => t.includes('.') ? t.split('.').pop() : t;
 
-// ---------- class index ----------
-/**
- * classIndex: Map<className, {
- *   kind: 'class'|'enum',
- *   file: string,
- *   fields?: [{ name, type, nullable, schemaDesc?, schemaExample?, jsonName? }],
- *   enumValues?: string[]
- * }>
- */
-const classIndex = new Map();
+// 3) 클래스 수준 @Tag(description="...")
+const findClassTagDescription = (classText) => {
+  const m = classText.match(/@Tag\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
+  return m ? (m[1] || '').trim() : '';
+};
 
-const parseJava = (text, file) => {
-  // enum
-  for (const m of text.matchAll(/\benum\s+([A-Za-z0-9_]+)\s*\{([\s\S]*?)\}/g)) {
-    const name = m[1];
-    const body = m[2];
-    const values = (body.split('\n')[0] || '')
-      .split(',')
-      .map(v => v.trim())
-      .filter(v => /^[A-Z0-9_]+(\s*\(.*\))?$/.test(v))
-      .map(v => v.replace(/\(.*\)/, '').trim());
-    classIndex.set(name, { kind: 'enum', file, enumValues: values });
-  }
+// ---------- content-type(consumes) 추출 ----------
+const findConsumesNear = (text, idx) => {
+  const around = text.slice(Math.max(0, idx - 400), idx + 400);
+  // 메서드 매핑의 consumes="..."
+  const m1 = around.match(/consumes\s*=\s*"(.*?)"/);
+  if (m1) return (m1[1] || '').trim();
+  return null;
+};
+const findConsumesInClass = (classText) => {
+  const m = classText.match(/@RequestMapping\s*\(\s*[^)]*consumes\s*=\s*"(.*?)"/);
+  return m ? (m[1] || '').trim() : null;
+};
 
-  // class
-  for (const m of text.matchAll(/\bclass\s+([A-Za-z0-9_]+)\s*(?:extends\s+[^{]+)?\s*(?:implements\s+[^{]+)?\s*\{([\s\S]*?)\}/g)) {
-    const name = m[1];
-    const body = m[2];
-    const fields = [];
-
-    const lines = body.split('\n');
-    let annos = [];
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-
-      const a = line.match(/^@([A-Za-z0-9_.]+)(\((.*)\))?/);
-      if (a) { annos.push(line); continue; }
-
-      const f = line.match(/(private|protected|public)\s+([A-Za-z0-9_<>\[\]., ?]+)\s+([A-Za-z0-9_]+)\s*;/);
-      if (f) {
-        const type = f[2].replace(/\s+/g, ' ').trim();
-        const fname = f[3].trim();
-
-        let schemaDesc, schemaExample, jsonName, nullable = true;
-        for (const an of annos) {
-          if (/NotNull|NotBlank/i.test(an)) nullable = false;
-          const sdesc = an.match(/@Schema\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
-          if (sdesc) schemaDesc = sdesc[1].trim();
-          const sex = an.match(/@Schema\s*\(\s*[^)]*example\s*=\s*"(.*?)"/s);
-          if (sex) schemaExample = sex[1].trim();
-          const jn = an.match(/@JsonProperty\s*\(\s*"(.*?)"\s*\)/);
-          if (jn) jsonName = jn[1].trim();
-          const fmt = an.match(/@JsonFormat\s*\(\s*[^)]*pattern\s*=\s*"(.*?)"/);
-          if (fmt) schemaDesc = schemaDesc || `format: ${fmt[1]}`;
-        }
-
-        fields.push({ name: fname, type, nullable, schemaDesc, schemaExample, jsonName });
-        annos = [];
+// ---------- 클래스 텍스트 추출 ----------
+const findEnclosingClassText = (text, methodIdx) => {
+  // 매우 단순한 휴리스틱: methodIdx 이전에서 가장 가까운 "class XXX {" 찾고,
+  // 그 뒤로 닫는 } 까지를 클래스 블록으로 간주
+  const before = text.slice(0, methodIdx);
+  const classStart = before.lastIndexOf('class ');
+  if (classStart === -1) return '';
+  // 여길 기준으로 이후 전체를 보고 첫 번째 '{'와 매칭되는 '}' 찾기
+  const fromClass = text.slice(classStart);
+  const braceOpen = fromClass.indexOf('{');
+  if (braceOpen === -1) return '';
+  let depth = 0;
+  for (let i = braceOpen; i < fromClass.length; i++) {
+    const ch = fromClass[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        return fromClass.slice(0, i + 1);
       }
     }
-    if (fields.length) classIndex.set(name, { kind: 'class', file, fields });
   }
+  return '';
 };
 
-const parseKotlin = (text, file) => {
-  // enum class
-  for (const m of text.matchAll(/\benum\s+class\s+([A-Za-z0-9_]+)\s*\{([\s\S]*?)\}/g)) {
-    const name = m[1];
-    const body = m[2];
-    const values = (body.split('\n')[0] || '')
-      .split(',').map(v => v.trim()).filter(v => /^[A-Z0-9_]+$/.test(v));
-    classIndex.set(name, { kind: 'enum', file, enumValues: values });
-  }
-
-  // data class Foo(@field:NotNull val name: String, val age: Int?)
-  for (const m of text.matchAll(/\bdata\s+class\s+([A-Za-z0-9_]+)\s*\(([\s\S]*?)\)/g)) {
-    const name = m[1];
-    const params = m[2];
-    const fields = [];
-    for (const pm of params.matchAll(/(@[A-Za-z0-9_:.() ,"=]*\s*)?(val|var)\s+([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_<>,?.\[\]]+)/g)) {
-      const rawAnno = (pm[1] || '').trim();
-      const fname = pm[3];
-      const ftype = pm[4].trim();
-      const nullable = /\?$/.test(ftype) ? true : !/NotNull|NotBlank/i.test(rawAnno);
-      let schemaDesc, schemaExample, jsonName;
-      const sdesc = rawAnno.match(/@Schema\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
-      if (sdesc) schemaDesc = sdesc[1].trim();
-      const sex = rawAnno.match(/@Schema\s*\(\s*[^)]*example\s*=\s*"(.*?)"/s);
-      if (sex) schemaExample = sex[1].trim();
-      const jn = rawAnno.match(/@JsonProperty\s*\(\s*"(.*?)"\s*\)/);
-      if (jn) jsonName = jn[1].trim();
-
-      fields.push({ name: fname, type: ftype, nullable, schemaDesc, schemaExample, jsonName });
-    }
-    classIndex.set(name, { kind: 'class', file, fields });
-  }
-
-  // class { val foo: String ... }
-  for (const m of text.matchAll(/\bclass\s+([A-Za-z0-9_]+)\s*(?:\((?:[\s\S]*?)\))?\s*\{([\s\S]*?)\}/g)) {
-    const name = m[1];
-    const body = m[2];
-    const fields = [];
-    let lastAnno = [];
-    for (const fm of body.matchAll(/^\s*(@[A-Za-z0-9_:.() ,"=]+)\s*$|^\s*(val|var)\s+([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_<>,?.\[\]]+)/gm)) {
-      if (fm[1]) { lastAnno.push(fm[1]); continue; }
-      const fname = fm[3];
-      const ftype = fm[4].trim();
-      const rawAnno = lastAnno.join(' '); lastAnno = [];
-      const nullable = /\?$/.test(ftype) ? true : !/NotNull|NotBlank/i.test(rawAnno);
-      let schemaDesc, schemaExample, jsonName;
-      const sdesc = rawAnno.match(/@Schema\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
-      if (sdesc) schemaDesc = sdesc[1].trim();
-      const sex = rawAnno.match(/@Schema\s*\(\s*[^)]*example\s*=\s*"(.*?)"/s);
-      if (sex) schemaExample = sex[1].trim();
-      const jn = rawAnno.match(/@JsonProperty\s*\(\s*"(.*?)"\s*\)/);
-      if (jn) jsonName = jn[1].trim();
-
-      fields.push({ name: fname, type: ftype, nullable, schemaDesc, schemaExample, jsonName });
-    }
-    if (fields.length) classIndex.set(name, { kind: 'class', file, fields });
-  }
-};
-
-// ---------- schema/sample builders ----------
-const GENERIC_RE = /([A-Za-z0-9_$.]+)\s*<\s*([A-Za-z0-9_<>,?.\[\] $.]+)\s*>/;
-
-const resolveToSchemaAndSample = (rawType, depth = 0) => {
-  if (!rawType) return [{ type: 'string' }, 'string'];
-  if (depth > MAX_DEPTH) return [{ type: 'object' }, {}];
-
-  let t = rawType.trim().replace(/\s+/g, ' ');
-
-  // arrays / collections
-  if (/\[\]$/.test(t)) {
-    const base = t.replace(/\[\]$/, '').trim();
-    const [itemSchema, itemSample] = resolveToSchemaAndSample(base, depth + 1);
-    return [{ type: 'array', items: itemSchema }, [itemSample]];
-  }
-  if (/^(List|Array|MutableList|Set|Collection)\b/i.test(t)) {
-    const gm = t.match(GENERIC_RE);
-    const arg = gm ? gm[2].split(',')[0].trim() : 'string';
-    const [itemSchema, itemSample] = resolveToSchemaAndSample(arg, depth + 1);
-    return [{ type: 'array', items: itemSchema }, [itemSample]];
-  }
-  if (/^Map\b/i.test(t)) return [{ type: 'object', additionalProperties: true }, {}];
-
-  // generics
-  const gm = t.match(GENERIC_RE);
-  if (gm) {
-    const outer = stripPkg(gm[1]);
-    const inner = gm[2].split(',')[0].trim();
-    const dto = classIndex.get(outer);
-    if (dto) return fromClass(dto, depth + 1);
-    return resolveToSchemaAndSample(inner, depth + 1);
-  }
-
-  // strip package
-  t = stripPkg(t);
-
-  // enum
-  const enumHit = classIndex.get(t);
-  if (enumHit && enumHit.kind === 'enum') {
-    const schema = { type: 'string', enum: enumHit.enumValues || [] };
-    const sample = (enumHit.enumValues && enumHit.enumValues[0]) || 'ENUM';
-    return [schema, sample];
-  }
-
-  // DTO/POJO
-  const dto = classIndex.get(t);
-  if (dto && dto.kind === 'class') return fromClass(dto, depth + 1);
-
-  // primitive
-  const base = primitiveSample(t);
-  const fmt = primitiveFormat(t);
-  const schema = { type: typeof base === 'number' ? 'number' : (typeof base === 'boolean' ? 'boolean' : 'string') };
-  if (fmt) schema.format = fmt;
-  return [schema, base];
-};
-
-const fromClass = (dto, depth) => {
-  const properties = {};
-  const required = [];
-  for (const f of (dto.fields || [])) {
-    const name = f.jsonName || f.name;
-    const [sch, sample] = resolveToSchemaAndSample(f.type, depth + 1);
-    if (f.schemaDesc) sch.description = (sch.description ? sch.description + ' ' : '') + f.schemaDesc;
-    const fmt = primitiveFormat(f.type);
-    if (fmt && !sch.format) sch.format = fmt;
-    if (f.schemaExample) sch.example = coerceExample(f.schemaExample, sch);
-    properties[name] = sch;
-    if (!f.nullable) required.push(name);
-  }
-  const schema = { type: 'object', properties };
-  if (required.length) schema.required = required;
-
-  const sample = {};
-  for (const [k, sch] of Object.entries(properties)) {
-    sample[k] = sch.example !== undefined ? sch.example : sampleFromSchema(sch);
-  }
-  return [schema, sample];
-};
-
-const sampleFromSchema = (sch) => {
-  if (sch.example !== undefined) return sch.example;
-  if (sch.type === 'number') return 0;
-  if (sch.type === 'boolean') return true;
-  if (sch.type === 'string') {
-    if (sch.format === 'uuid') return '00000000-0000-0000-0000-000000000000';
-    if (sch.format === 'date-time') return '2025-01-01T00:00:00Z';
-    return 'string';
-  }
-  if (sch.type === 'array') return [sampleFromSchema(sch.items || { type: 'string' })];
-  if (sch.type === 'object') {
-    const obj = {};
-    for (const [k, v] of Object.entries(sch.properties || {})) obj[k] = sampleFromSchema(v);
-    return obj;
-  }
-  return 'string';
-};
-const coerceExample = (raw, schema) => {
-  if (raw === undefined) return undefined;
-  try {
-    if (schema.type === 'number') return Number(raw);
-    if (schema.type === 'boolean') return /^(true|1)$/i.test(raw);
-    if (schema.type === 'array') return raw.trim().startsWith('[') ? JSON.parse(raw) : [raw];
-    if (schema.type === 'object') return raw.trim().startsWith('{') ? JSON.parse(raw) : undefined;
-    return raw;
-  } catch { return undefined; }
-};
-
-// ---------- Swagger @Operation(description) ONLY ----------
-// CHANGED: 오직 @Operation(description="...")만 사용
-const extractOperationDescriptionOnly = (text, idx) => {
-  const around = text.slice(Math.max(0, idx - 2000), idx + 2000);
-  const op = around.match(/@Operation\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
-  return op ? (op[1] || '').trim() : '';
-};
-
-// ---------- 1) index classes ----------
+// ---------- 메인 스캔 ----------
 const files = SRC_DIRS.flatMap((d) => walk(path.join(root, d)));
-for (const f of files) {
-  const ext = path.extname(f);
-  const txt = readText(f);
-  if (!txt) continue;
-  if (ext === '.java') parseJava(txt, f);
-  if (ext === '.kt') parseKotlin(txt, f);
-}
-
-// ---------- 2) scan endpoints (Spring) ----------
 const endpoints = [];
-for (const file of files) {
-  const ext = path.extname(file);
-  if (ext !== '.java' && ext !== '.kt') continue;
 
+for (const file of files) {
   const text = readText(file);
   if (!text) continue;
   const rel = path.relative(root, file);
+
+  // 컨트롤러 클래스만 진행
   if (!/@(RestController|Controller)\b/.test(text)) continue;
 
-  // class-level prefix
+  // 클래스 레벨 prefix (@RequestMapping)
   let classPrefix = '';
   const cp =
     [...text.matchAll(/@RequestMapping\s*\(\s*(?:value\s*=\s*)?['"`]([^'"`]+)['"`]\s*\)/g)].pop() ||
     [...text.matchAll(/@RequestMapping\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g)].pop();
   if (cp) classPrefix = (cp[1] || '').trim();
 
-  const mapRe = /@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*\(\s*['"`]?([^'"`)]*)['"`]?\s*\)[\s\S]*?\{/g;
+  // 메서드 매핑
+  const mapRe = /@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*\(\s*(['"`]?)([^'"`)]*)\2\s*\)[\s\S]*?\{/g;
   for (const m of text.matchAll(mapRe)) {
     const idx = m.index || 0;
     const method = m[1].replace('Mapping', '').toUpperCase();
-    const sub = (m[2] || '').trim();
+    const sub = (m[3] || '').trim();
     const full = normPath('/' + [classPrefix, sub].filter(Boolean).join('/'));
     const version = extractVersion(full);
 
-    // description = @Operation(description="...")만
-    const description = extractOperationDescriptionOnly(text, idx); // CHANGED
-    const contentType = 'application/json';
-
-    // @RequestBody 타입 추출 (Java/Kotlin)
-    const after = text.slice(idx, idx + 1200);
-    let rbType = null;
-    const javaRB = after.match(/@RequestBody\s+([A-Za-z0-9_<>$begin:math:display$$end:math:display$.$]+)\s+[A-Za-z0-9_]+/);
-    if (javaRB) rbType = javaRB[1].replace(/<.*?>/g, '').trim();
-    if (!rbType) {
-      const ktRB = after.match(/@RequestBody\s+[A-Za-z0-9_]+\s*:\s*([A-Za-z0-9_<>$begin:math:display$$end:math:display$.$]+)/);
-      if (ktRB) rbType = ktRB[1].replace(/<.*?>/g, '').trim();
+    // description: @Operation ⇒ 블록 "description:" ⇒ @Tag
+    let description = findOperationDescription(text, idx);
+    if (!description) {
+      description = findNearestBlockDescription(text, idx);
+      if (!description) {
+        const classText = findEnclosingClassText(text, idx);
+        description = findClassTagDescription(classText);
+      }
     }
 
-    let requestBodySchema = null;
-    let requestBodySample = null;
-    let responseBodySchema = null;      // CHANGED
-    let responseBodySample = null;      // CHANGED
-
-    if (rbType) {
-      const [reqSch, reqSample] = resolveToSchemaAndSample(rbType, 0);
-      requestBodySchema = reqSch;
-      requestBodySample = reqSample;
-
-      // POST이면 응답 바디도 동일 DTO로 생성  // CHANGED
-      if (method === 'POST') {
-        responseBodySchema = reqSch;
-        responseBodySample = reqSample;
-      }
+    // contentType: 메서드 consumes ⇒ 클래스 consumes ⇒ 기본 application/json
+    let contentType = findConsumesNear(text, idx);
+    if (!contentType) {
+      const classText = findEnclosingClassText(text, idx);
+      contentType = findConsumesInClass(classText) || 'application/json';
     }
 
     endpoints.push({
@@ -367,18 +164,13 @@ for (const file of files) {
       version,
       file: rel,
       line: indexToLine(text, idx),
-      handler: '',
-      description,              // @Operation.description only
-      contentType,              // 기본 application/json
-      requestBodySchema,
-      requestBodySample,
-      responseBodySchema,       // CHANGED
-      responseBodySample        // CHANGED
+      description,
+      contentType
     });
   }
 }
 
-// ---------- 3) dedupe & save ----------
+// 중복 제거
 const seen = new Set();
 const out = [];
 for (const e of endpoints) {
@@ -388,6 +180,7 @@ for (const e of endpoints) {
   out.push(e);
 }
 
+// 저장
 const outPath = path.join(root, '.api-scan.json');
 fs.writeFileSync(outPath, JSON.stringify(out, null, 2));
 console.log(`Found ${out.length} endpoints -> ${outPath}`);
