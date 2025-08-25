@@ -1,49 +1,32 @@
 // tools/scan-apis.mjs
-// Windows 11 + Node (ESM) 환경 가정. 외부 라이브러리 없이 동작.
-// 목적: 프로젝트의 HTTP 엔드포인트를 스캔하고, 설명/요청 바디 샘플까지 추정하여 .api-scan.json에 저장.
-//
-// 지원(휴리스틱):
-// - Express/Router/Fastify: app.METHOD()/router.METHOD()/fastify.METHOD()
-//   · 설명: 바로 위 JSDoc /** ... */ 또는 // 한 줄 주석
-//   · 요청바디: 근처 Joi/Zod 스키마, req.body의 사용 키, 미들웨어 body-parser/JSON 사용 가정
-// - NestJS: @Controller(prefix) + @Get/@Post/.. + @Body() DTO
-//   · 설명: 데코레이터 위 JSDoc/주석
-//   · 요청바디: DTO 클래스(필드 타입, class-validator 데코레이터)로 샘플 추정
-// - Spring MVC/Boot: @RestController/@Controller + @RequestMapping/@*Mapping
-//   · 설명: 메서드/클래스 Javadoc/** */ 또는 // 주석
-//   · 요청바디: @RequestBody 파라미터의 POJO 필드 타입으로 샘플 추정
-//
-// 한계: 정규식 기반이라 100%는 아님. 그래도 Continue 같은 LLM 도구가 후처리하기엔 충분한 피드가 되도록 설계.
-// 출력: [{ framework, method, path, file, line, handler, description, contentType, requestBodySample }]
-// -----------------------------------------------------------------------------------------------
+// 목적: 프로젝트의 HTTP 엔드포인트를 스캔하고 .api-scan.json에 요약 저장
+// 업그레이드 사항:
+//  - version: path 선두의 v1/v2 등 추출
+//  - description: Swagger 정보를 최우선 사용 (@ApiOperation/@Operation/swagger-jsdoc)
+//  - requestBodySample: Swagger(@ApiBody/@Schema/swagger-jsdoc) 우선, 보강으로 DTO/Zod/Joi/req.body 힌트
+// Node (ESM) 환경, 외부 라이브러리 없음.
 
 import fs from 'fs';
 import path from 'path';
 
 const root = process.cwd();
-const SRC_DIRS = ['src', 'src/main/java', 'src/main/kotlin']; // 필요시 추가
+const SRC_DIRS = ['src', 'src/main/java', 'src/main/kotlin'];
 const TARGET_EXTS = new Set(['.js', '.ts', '.jsx', '.tsx', '.java', '.kt']);
 
-// 간단 타입→더미 값 매핑
 const typeSample = (t) => {
   const s = (t || '').toLowerCase();
-  if (s.includes('int') || s.includes('long') || s.includes('double') || s.includes('float') || s === 'number') return 0;
-  if (s.includes('bool') || s === 'boolean') return true;
-  if (s.includes('date') || s.includes('localdate') || s.includes('instant')) return '2025-01-01T00:00:00Z';
-  if (s.includes('uuid')) return '00000000-0000-0000-0000-000000000000';
-  if (s.includes('string') || s.includes('char') || s === 'any' || s === '') return 'string';
-  if (s.includes('list') || s.includes('array') || s.endsWith('[]')) return [];
-  if (s.includes('map')) return {};
+  if (/(^|[^a-z])int|long|double|float|number/.test(s)) return 0;
+  if (/bool|boolean/.test(s)) return true;
+  if (/date|localdate|instant/.test(s)) return '2025-01-01T00:00:00Z';
+  if (/uuid/.test(s)) return '00000000-0000-0000-0000-000000000000';
+  if (/list|array|\[\]$/.test(s)) return [];
+  if (/map/.test(s)) return {};
   return 'string';
 };
 
-// 결과 컨테이너
 const endpoints = [];
+const dtoIndex = new Map(); // name -> { fields:[{name,type,notes}], file }
 
-// DTO/POJO 인덱스 (Nest/Spring용)
-const dtoIndex = new Map(); // name -> { fields: [{name,type,notes}], file }
-
-// 유틸: 디렉토리 순회
 const walk = (dir, out = []) => {
   if (!fs.existsSync(dir)) return out;
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -62,11 +45,221 @@ const readText = (file) => {
   try { return fs.readFileSync(file, 'utf8'); } catch { return ''; }
 };
 
-// 유틸: 파일에서 특정 인덱스 주변 주석/JSDoc 추출
-const extractNearbyDescription = (text, idx) => {
-  // 바로 위 /** ... */ 또는 // ...
+const indexToLine = (text, idx) => text.slice(0, idx).split('\n').length;
+const normPath = (p) => (p || '').replace(/\/+/g, '/').replace(/\/$/, '') || '/';
+const extractVersion = (p) => {
+  const m = /^\/?(v\d+)\b/i.exec(p || '');
+  return m ? m[1].toLowerCase() : null;
+};
+
+// ---------- DTO/POJO 인덱싱 ----------
+const parseNestDtoFromText = (text, file) => {
+  const classRe = /export\s+class\s+([A-Za-z0-9_]+)\s*\{([\s\S]*?)\}/g;
+  for (const m of text.matchAll(classRe)) {
+    const name = m[1];
+    const body = m[2];
+    const fields = [];
+    const lines = body.split('\n');
+    let notes = [];
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) continue;
+      const c1 = line.match(/^\/\/\s*(.*)$/);
+      if (c1) { notes.push(c1[1]); continue; }
+      const f = line.match(/^([A-Za-z0-9_]+)\??:\s*([^;{]+);/);
+      if (f) {
+        fields.push({ name: f[1], type: f[2].trim(), notes: notes.join(' ') });
+        notes = [];
+        continue;
+      }
+      const deco = line.match(/^@([A-Za-z0-9_]+)\b/);
+      if (deco) notes.push('@' + deco[1]);
+    }
+    if (fields.length) dtoIndex.set(name, { fields, file });
+  }
+};
+
+const parseJavaPojoFromText = (text, file) => {
+  const classRe = /class\s+([A-Za-z0-9_]+)\s*\{([\s\S]*?)\}/g;
+  for (const m of text.matchAll(classRe)) {
+    const name = m[1];
+    const body = m[2];
+    const fields = [];
+    const fieldRe = /(private|protected|public)\s+([A-Za-z0-9_<>\[\]]+)\s+([A-Za-z0-9_]+)\s*;/g;
+    for (const fm of body.matchAll(fieldRe)) {
+      fields.push({ name: fm[3].trim(), type: fm[2].trim(), notes: '' });
+    }
+    if (fields.length) dtoIndex.set(name, { fields, file });
+  }
+};
+
+const buildSampleFromDtoName = (dtoName) => {
+  const dto = dtoIndex.get(dtoName);
+  if (!dto) return null;
+  const obj = {};
+  for (const f of dto.fields) obj[f.name] = typeSample(f.type);
+  return obj;
+};
+
+const buildSampleFromNearbyZodJoiReqBody = (text, idx) => {
+  const around = text.slice(Math.max(0, idx - 2000), idx + 2000);
+
+  // zod
+  const z = around.match(/z\.object\s*\(\s*\{([\s\S]*?)\}\s*\)/);
+  if (z) {
+    const body = z[1];
+    const obj = {};
+    const propRe = /([A-Za-z0-9_]+)\s*:\s*z\.([A-Za-z0-9_]+)/g;
+    for (const m of body.matchAll(propRe)) obj[m[1]] = typeSample(m[2]);
+    if (Object.keys(obj).length) return obj;
+  }
+
+  // Joi
+  const j = around.match(/Joi\.object\s*\(\s*\{([\s\S]*?)\}\s*\)/);
+  if (j) {
+    const body = j[1];
+    const obj = {};
+    const propRe = /([A-Za-z0-9_]+)\s*:\s*Joi\.([A-Za-z0-9_]+)/g;
+    for (const m of body.matchAll(propRe)) obj[m[1]] = typeSample(m[2]);
+    if (Object.keys(obj).length) return obj;
+  }
+
+  // req.body.key
+  const rb = around.match(/req\.body\.([A-Za-z0-9_]+)/g);
+  if (rb) {
+    const obj = {};
+    for (const hit of rb) obj[hit.split('.').pop()] = 'string';
+    if (Object.keys(obj).length) return obj;
+  }
+  return null;
+};
+
+// ---------- Swagger 우선 파싱 ----------
+const extractSwaggerNest = (text, idx) => {
+  // 주변 2k 범위에서 Nest swagger 데코레이터 인자 파싱
+  const around = text.slice(Math.max(0, idx - 2000), idx + 2000);
+  const out = { description: '', sample: null, contentType: null };
+
+  // @ApiOperation({ description: '...' })
+  const op = around.match(/@ApiOperation\s*\(\s*\{[\s\S]*?description\s*:\s*['"`]([\s\S]*?)['"`][\s\S]*?\}\s*\)/);
+  if (op) out.description = (op[1] || '').trim();
+
+  // @ApiConsumes('multipart/form-data') / @ApiProduces('application/json')
+  const con = around.match(/@ApiConsumes\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/);
+  if (con) out.contentType = con[1].trim();
+  const pro = around.match(/@ApiProduces\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/);
+  if (!out.contentType && pro) out.contentType = pro[1].trim();
+
+  // @ApiBody({ type: FooDto }) or @ApiBody({ schema: { properties: {...} } })
+  const body = around.match(/@ApiBody\s*\(\s*\{([\s\S]*?)\}\s*\)/);
+  if (body) {
+    const inside = body[1];
+    // type: FooDto
+    const t = inside.match(/type\s*:\s*([A-Za-z0-9_]+)/);
+    if (t) {
+      out.sample = buildSampleFromDtoName(t[1]);
+    }
+    // schema: { properties: { key: { type: 'string' }, ... } }
+    if (!out.sample) {
+      const props = inside.match(/properties\s*:\s*\{([\s\S]*?)\}/);
+      if (props) {
+        const obj = {};
+        const pRe = /([A-Za-z0-9_]+)\s*:\s*\{\s*type\s*:\s*['"`]([^'"`]+)['"`]/g;
+        for (const m of props[1].matchAll(pRe)) obj[m[1]] = typeSample(m[2]);
+        if (Object.keys(obj).length) out.sample = obj;
+      }
+    }
+    // content type in ApiBody({ content: { 'multipart/form-data': {...} } })
+    const ct = inside.match(/content\s*:\s*\{\s*['"`]([^'"`]+)['"`]\s*:/);
+    if (!out.contentType && ct) out.contentType = ct[1];
+  }
+
+  return out;
+};
+
+const extractSwaggerSpring = (text, idx) => {
+  // 주변 2k 범위에서 Swagger v3 어노테이션 파싱
+  const around = text.slice(Math.max(0, idx - 2000), idx + 2000);
+  const out = { description: '', sample: null, contentType: null };
+
+  // @Operation(description = "...")
+  const op = around.match(/@Operation\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
+  if (op) out.description = (op[1] || '').trim();
+  // 구버전 @ApiOperation(value="...", notes="...")
+  const apiOp = around.match(/@ApiOperation\s*\(\s*[^)]*notes\s*=\s*"(.*?)"/s);
+  if (!out.description && apiOp) out.description = (apiOp[1] || '').trim();
+
+  // media type: @RequestMapping(consumes="application/json") / @PostMapping(consumes="...")
+  const cons = around.match(/consumes\s*=\s*"(.*?)"/);
+  if (cons) out.contentType = cons[1].trim();
+
+  // @io.swagger.v3.oas.annotations.parameters.RequestBody(
+  //   content = @Content(mediaType="application/json",
+  //     schema = @Schema(implementation = CreateReq.class)))
+  const impl = around.match(/@Schema\s*\(\s*implementation\s*=\s*([A-Za-z0-9_]+)\.class\s*\)/);
+  if (impl) out.sample = buildSampleFromDtoName(impl[1]);
+  const mt = around.match(/mediaType\s*=\s*"(.*?)"/);
+  if (!out.contentType && mt) out.contentType = mt[1].trim();
+
+  // swagger-jsdoc 스타일 블록 (/** * @openapi ... */)에서 requestBody properties 추출(아주 단순)
+  if (!out.sample) {
+    const blockIdx = around.lastIndexOf('/**');
+    const endIdx = around.indexOf('*/', blockIdx + 3);
+    if (blockIdx !== -1 && endIdx !== -1) {
+      const block = around.slice(blockIdx, endIdx + 2);
+      // properties:
+      const props = block.match(/properties:\s*\{([\s\S]*?)\}\n/);
+      if (props) {
+        const obj = {};
+        const pRe = /([A-Za-z0-9_]+):\s*\{\s*type:\s*(['"`]?)([A-Za-z0-9_]+)\2/g;
+        for (const m of props[1].matchAll(pRe)) obj[m[1]] = typeSample(m[3]);
+        if (Object.keys(obj).length) out.sample = obj;
+      }
+      // content-type
+      const ct = block.match(/content:\s*\n?\s*(['"`]?)([^'"`\n]+)\1\s*:/);
+      if (!out.contentType && ct) out.contentType = ct[2].trim();
+      // description
+      const desc = block.match(/description:\s*(['"`]?)([\s\S]*?)\1\s*\n/);
+      if (desc && !out.description) out.description = desc[2].trim();
+    }
+  }
+
+  return out;
+};
+
+const extractSwaggerExpress = (text, idx) => {
+  // swagger-jsdoc 블록 /** * @openapi ... */ 또는 /** * @swagger ... */
+  const around = text.slice(Math.max(0, idx - 3000), idx + 3000);
+  const out = { description: '', sample: null, contentType: null };
+
+  const blockIdx = around.lastIndexOf('/**');
+  const endIdx = around.indexOf('*/', blockIdx + 3);
+  if (blockIdx !== -1 && endIdx !== -1) {
+    const block = around.slice(blockIdx, endIdx + 2);
+
+    // description:
+    const desc = block.match(/description:\s*(['"`]?)([\s\S]*?)\1\s*\n/);
+    if (desc) out.description = (desc[2] || '').trim();
+
+    // content type: content: { application/json: { schema: ... } }
+    const ct = block.match(/content:\s*\n?\s*(['"`]?)([^'"`\n]+)\1\s*:/);
+    if (ct) out.contentType = ct[2].trim();
+
+    // properties:
+    const props = block.match(/properties:\s*\{([\s\S]*?)\}\n/);
+    if (props) {
+      const obj = {};
+      const pRe = /([A-Za-z0-9_]+):\s*\{\s*type:\s*(['"`]?)([A-Za-z0-9_]+)\2/g;
+      for (const m of props[1].matchAll(pRe)) obj[m[1]] = typeSample(m[3]);
+      if (Object.keys(obj).length) out.sample = obj;
+    }
+  }
+  return out;
+};
+
+// 일반 주석(백업용) - Swagger가 없을 때만
+const extractNearbyComment = (text, idx) => {
   const upToIdx = text.slice(0, idx);
-  // /** ... */ 마지막 블록
   const blockIdx = upToIdx.lastIndexOf('/**');
   const endIdx = upToIdx.lastIndexOf('*/');
   if (blockIdx !== -1 && endIdx !== -1 && endIdx > blockIdx) {
@@ -74,7 +267,6 @@ const extractNearbyDescription = (text, idx) => {
     const lines = block.split('\n').map((l) => l.replace(/^\s*\/?\**\s?/, '').trim()).filter(Boolean);
     if (lines.length) return lines.join(' ');
   }
-  // // ... 연속 라인
   const lines = upToIdx.split('\n');
   const picked = [];
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -82,115 +274,7 @@ const extractNearbyDescription = (text, idx) => {
     if (m) picked.unshift(m[1].trim());
     else break;
   }
-  if (picked.length) return picked.join(' ');
-  return '';
-};
-
-// 유틸: 라인 번호 계산
-const indexToLine = (text, idx) => text.slice(0, idx).split('\n').length;
-
-// Nest DTO 간단 파싱: class XxxDto { field: type; @IsString() ... }
-const parseNestDtoFromText = (text, file) => {
-  // class FooDto { ... }
-  const classRe = /export\s+class\s+([A-Za-z0-9_]+)\s*\{([\s\S]*?)\}/g;
-  for (const m of text.matchAll(classRe)) {
-    const name = m[1];
-    const body = m[2];
-    const fields = [];
-    // 데코레이터 포함 라인 분리
-    const lines = body.split('\n');
-    let pendingNotes = [];
-    for (const raw of lines) {
-      const line = raw.trim();
-      if (!line) continue;
-      // 주석 누적
-      const c1 = line.match(/^\/\/\s*(.*)$/);
-      if (c1) { pendingNotes.push(c1[1]); continue; }
-      // 필드: foo?: string;  foo: number;
-      const f = line.match(/^([A-Za-z0-9_]+)\??:\s*([^;{]+);/);
-      if (f) {
-        const fname = f[1];
-        const ftype = f[2].trim();
-        const note = pendingNotes.join(' ');
-        fields.push({ name: fname, type: ftype, notes: note });
-        pendingNotes = [];
-        continue;
-      }
-      // 데코레이터는 notes에 포함
-      const deco = line.match(/^@([A-Za-z0-9_]+)\b(.*)/);
-      if (deco) {
-        pendingNotes.push('@' + deco[1] + (deco[2] || ''));
-      }
-    }
-    dtoIndex.set(name, { fields, file });
-  }
-};
-
-// Spring POJO 간단 파싱: class Xxx { private String name; ... }
-const parseJavaPojoFromText = (text, file) => {
-  const classRe = /class\s+([A-Za-z0-9_]+)\s*\{([\s\S]*?)\}/g;
-  for (const m of text.matchAll(classRe)) {
-    const name = m[1];
-    const body = m[2];
-    const fields = [];
-    // private/protected/public Type name;
-    const fieldRe = /(private|protected|public)\s+([A-Za-z0-9_<>\[\]]+)\s+([A-Za-z0-9_]+)\s*;/g;
-    for (const fm of body.matchAll(fieldRe)) {
-      const ftype = fm[2].trim();
-      const fname = fm[3].trim();
-      fields.push({ name: fname, type: ftype, notes: '' });
-    }
-    if (fields.length) dtoIndex.set(name, { fields, file });
-  }
-};
-
-// 요청 바디 샘플 생성 (DTO/POJO 또는 주변 힌트 기반)
-const buildSampleFromDtoName = (dtoName) => {
-  const dto = dtoIndex.get(dtoName);
-  if (!dto) return null;
-  const obj = {};
-  for (const f of dto.fields) {
-    obj[f.name] = typeSample(f.type);
-  }
-  return obj;
-};
-
-const buildSampleFromNearbyJoiZod = (text, idx) => {
-  // 아주 단순: const schema = z.object({ key: z.string(), age: z.number() })
-  const around = text.slice(Math.max(0, idx - 2000), idx + 2000);
-  // zod
-  const z = around.match(/z\.object\s*\(\s*\{([\s\S]*?)\}\s*\)/);
-  if (z) {
-    const body = z[1];
-    const obj = {};
-    const propRe = /([A-Za-z0-9_]+)\s*:\s*z\.([A-Za-z0-9_]+)/g;
-    for (const m of body.matchAll(propRe)) {
-      obj[m[1]] = typeSample(m[2]);
-    }
-    if (Object.keys(obj).length) return obj;
-  }
-  // Joi
-  const j = around.match(/Joi\.object\s*\(\s*\{([\s\S]*?)\}\s*\)/);
-  if (j) {
-    const body = j[1];
-    const obj = {};
-    const propRe = /([A-Za-z0-9_]+)\s*:\s*Joi\.([A-Za-z0-9_]+)/g;
-    for (const m of body.matchAll(propRe)) {
-      obj[m[1]] = typeSample(m[2]);
-    }
-    if (Object.keys(obj).length) return obj;
-  }
-  // req.body 키 사용 흔적 (req.body.foo)
-  const rb = around.match(/req\.body\.[A-Za-z0-9_]+/g);
-  if (rb) {
-    const obj = {};
-    for (const hit of rb) {
-      const k = hit.split('.').pop();
-      obj[k] = 'string';
-    }
-    if (Object.keys(obj).length) return obj;
-  }
-  return null;
+  return picked.join(' ');
 };
 
 const contentTypeFromNearby = (text, idx) => {
@@ -200,56 +284,54 @@ const contentTypeFromNearby = (text, idx) => {
   return 'application/json';
 };
 
-// 핸들러 이름 추정 (함수명/메서드명)
 const guessHandlerName = (text, idx) => {
-  // 직후 괄호 내부의 식별자 or function 이름
   const after = text.slice(idx, idx + 400);
-  // function foo(req,res) {..}
   const f1 = after.match(/function\s+([A-Za-z0-9_]+)/);
   if (f1) return f1[1];
-  // (req,res)=> or handler 변수
   const f2 = after.match(/([A-Za-z0-9_]+)\s*[,)]/);
   if (f2) return f2[1];
   return '';
 };
 
-// ------------------------- 1) 인덱싱(DTO/POJO) -------------------------
+// ---------- 1) 파일 모음 & DTO 인덱싱 ----------
 const allFiles = SRC_DIRS.flatMap((d) => walk(path.join(root, d)));
 for (const file of allFiles) {
   const ext = path.extname(file);
   const text = readText(file);
-  if (ext === '.ts' || ext === '.tsx' || ext === '.js' || ext === '.jsx') {
-    // Nest DTO
-    parseNestDtoFromText(text, file);
-  }
-  if (ext === '.java') {
-    // Spring POJO
-    parseJavaPojoFromText(text, file);
-  }
+  if (ext === '.ts' || ext === '.tsx' || ext === '.js' || ext === '.jsx') parseNestDtoFromText(text, file);
+  if (ext === '.java') parseJavaPojoFromText(text, file);
 }
 
-// ------------------------- 2) 엔드포인트 스캔 -------------------------
-
+// ---------- 2) 엔드포인트 스캔 ----------
 for (const file of allFiles) {
   const ext = path.extname(file);
   const text = readText(file);
   if (!text) continue;
+  const rel = path.relative(root, file);
 
   // Express/Router
   {
     const re = /(app|router)\.(get|post|put|delete|patch)\s*\(\s*['"`]([^'"`]+)['"`]\s*,/gi;
     for (const m of text.matchAll(re)) {
       const idx = m.index || 0;
+      const p = normPath(m[3]);
+      const ver = extractVersion(p);
+      const swag = extractSwaggerExpress(text, idx);
+      const desc = swag.description || extractNearbyComment(text, idx);
+      const sample = swag.sample ?? buildSampleFromNearbyZodJoiReqBody(text, idx);
+      const ctype = swag.contentType || contentTypeFromNearby(text, idx);
+
       endpoints.push({
         framework: 'express/router',
         method: m[2].toUpperCase(),
-        path: m[3],
-        file: path.relative(root, file),
+        path: p,
+        version: ver,
+        file: rel,
         line: indexToLine(text, idx),
         handler: guessHandlerName(text, idx),
-        description: extractNearbyDescription(text, idx),
-        contentType: contentTypeFromNearby(text, idx),
-        requestBodySample: buildSampleFromNearbyJoiZod(text, idx),
+        description: desc,
+        contentType: ctype,
+        requestBodySample: sample
       });
     }
   }
@@ -259,23 +341,30 @@ for (const file of allFiles) {
     const re = /fastify\.(get|post|put|delete|patch)\s*\(\s*['"`]([^'"`]+)['"`]\s*,/gi;
     for (const m of text.matchAll(re)) {
       const idx = m.index || 0;
+      const p = normPath(m[2]);
+      const ver = extractVersion(p);
+      const swag = extractSwaggerExpress(text, idx); // swagger-jsdoc 재사용
+      const desc = swag.description || extractNearbyComment(text, idx);
+      const sample = swag.sample ?? buildSampleFromNearbyZodJoiReqBody(text, idx);
+      const ctype = swag.contentType || contentTypeFromNearby(text, idx);
+
       endpoints.push({
         framework: 'fastify',
         method: m[1].toUpperCase(),
-        path: m[2],
-        file: path.relative(root, file),
+        path: p,
+        version: ver,
+        file: rel,
         line: indexToLine(text, idx),
         handler: guessHandlerName(text, idx),
-        description: extractNearbyDescription(text, idx),
-        contentType: contentTypeFromNearby(text, idx),
-        requestBodySample: buildSampleFromNearbyJoiZod(text, idx),
+        description: desc,
+        contentType: ctype,
+        requestBodySample: sample
       });
     }
   }
 
-  // NestJS: @Controller('/users') / @Post(':id')
+  // NestJS
   {
-    // 파일 내 controller prefix (가장 마지막 선언을 사용)
     let controllerPrefix = '';
     const cRe = /@Controller\s*\(\s*['"`]?([^'"`)]*)['"`]?\s*\)/g;
     for (const c of text.matchAll(cRe)) controllerPrefix = (c[1] || '').trim();
@@ -285,101 +374,101 @@ for (const file of allFiles) {
       const idx = m.index || 0;
       const method = m[1].toUpperCase();
       const sub = (m[2] || '').trim();
-      const fullPath = ('/' + [controllerPrefix, sub].filter(Boolean).join('/')).replace(/\/+/g, '/');
+      const full = normPath('/' + [controllerPrefix, sub].filter(Boolean).join('/'));
+      const ver = extractVersion(full);
 
-      // @Body() FooDto 탐색
-      const tail = text.slice(idx, idx + 600);
-      const b1 = tail.match(/@Body\(\s*\)\s*([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_]+)/);
-      const b2 = tail.match(/@Body\(\s*\)\s*\{([\s\S]*?)\}/); // 구조분해 바디
-      let sample = null;
-      if (b1) {
-        const dtoName = b1[2];
-        sample = buildSampleFromDtoName(dtoName);
+      // Swagger(Nest) 우선
+      const swag = extractSwaggerNest(text, idx);
+      let sample = swag.sample;
+
+      // @Body() Foo: FooDto → DTO 샘플
+      if (!sample) {
+        const tail = text.slice(idx, idx + 600);
+        const b1 = tail.match(/@Body\(\s*\)\s*([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_]+)/);
+        const b2 = tail.match(/@Body\(\s*\)\s*\{([\s\S]*?)\}/);
+        if (b1) sample = buildSampleFromDtoName(b1[2]);
+        else if (b2) {
+          const props = b2[1].split(',').map(s => s.trim()).filter(Boolean);
+          const obj = {}; for (const p of props) obj[p] = 'string';
+          if (Object.keys(obj).length) sample = obj;
+        }
       }
-      if (!sample && b2) {
-        // {name,age} → 샘플
-        const props = b2[1].split(',').map(s => s.trim()).filter(Boolean);
-        const obj = {};
-        for (const p of props) obj[p] = 'string';
-        if (Object.keys(obj).length) sample = obj;
-      }
-      if (!sample) sample = buildSampleFromNearbyJoiZod(text, idx);
+      if (!sample) sample = buildSampleFromNearbyZodJoiReqBody(text, idx);
 
       endpoints.push({
         framework: 'nest',
         method,
-        path: fullPath,
-        file: path.relative(root, file),
+        path: full,
+        version: ver,
+        file: rel,
         line: indexToLine(text, idx),
         handler: guessHandlerName(text, idx),
-        description: extractNearbyDescription(text, idx),
-        contentType: contentTypeFromNearby(text, idx),
-        requestBodySample: sample,
+        description: swag.description || extractNearbyComment(text, idx),
+        contentType: swag.contentType || contentTypeFromNearby(text, idx),
+        requestBodySample: sample
       });
     }
   }
 
-  // Spring: @RestController / @Controller + @RequestMapping/@*Mapping
+  // Spring
   {
     const hasCtrl = /@(RestController|Controller)\b/.test(text);
     if (hasCtrl) {
-      // 클래스 레벨 prefix
       let classPrefix = '';
-      // @RequestMapping(value="/x") 또는 @RequestMapping("/x")
-      const cpRe = /@RequestMapping\s*\(\s*(?:value\s*=\s*)?['"`]([^'"`]+)['"`]/g;
-      const cp2Re = /@RequestMapping\s*\(\s*['"`]([^'"`]+)['"`]/g;
-      const cpm = [...text.matchAll(cpRe), ...text.matchAll(cp2Re)].pop();
-      if (cpm) classPrefix = (cpm[1] || '').trim();
+      const cp = [...text.matchAll(/@RequestMapping\s*\(\s*(?:value\s*=\s*)?['"`]([^'"`]+)['"`]\s*\)/g)].pop()
+              || [...text.matchAll(/@RequestMapping\s*\(\s*['"`]([^'"`]+)['"`]\s*\)/g)].pop();
+      if (cp) classPrefix = (cp[1] || '').trim();
 
       const mapRe = /@(GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*\(\s*['"`]?([^'"`)]*)['"`]?\s*\)[\s\S]*?\{/g;
       for (const m of text.matchAll(mapRe)) {
         const idx = m.index || 0;
-        const kind = m[1];
+        const method = m[1].replace('Mapping', '').toUpperCase();
         const sub = (m[2] || '').trim();
-        const method = kind.replace('Mapping', '').toUpperCase();
-        const fullPath = ('/' + [classPrefix, sub].filter(Boolean).join('/')).replace(/\/+/g, '/');
+        const full = normPath('/' + [classPrefix, sub].filter(Boolean).join('/'));
+        const ver = extractVersion(full);
 
-        // 메서드 시그니처 근처 @RequestBody 타입 찾기
-        // public Resp create(@RequestBody CreateReq req) {
-        const after = text.slice(idx, idx + 600);
-        const rb = after.match(/@RequestBody\s+([A-Za-z0-9_<>$begin:math:display$$end:math:display$]+)\s+([A-Za-z0-9_]+)/);
-        let sample = null;
-        if (rb) {
-          // 제네릭 제거
-          const dtoName = rb[1].replace(/<.*?>/g, '').trim();
-          sample = buildSampleFromDtoName(dtoName);
+        const swag = extractSwaggerSpring(text, idx);
+
+        // @RequestBody Type → DTO 샘플
+        let sample = swag.sample;
+        if (!sample) {
+          const after = text.slice(idx, idx + 600);
+          const rb = after.match(/@RequestBody\s+([A-Za-z0-9_<>$begin:math:display$$end:math:display$]+)\s+[A-Za-z0-9_]+/);
+          if (rb) {
+            const dtoName = rb[1].replace(/<.*?>/g, '').trim();
+            sample = buildSampleFromDtoName(dtoName);
+          }
         }
-        if (!sample) sample = buildSampleFromNearbyJoiZod(text, idx);
+        if (!sample) sample = buildSampleFromNearbyZodJoiReqBody(text, idx);
 
         endpoints.push({
           framework: 'spring',
           method,
-          path: fullPath,
-          file: path.relative(root, file),
+          path: full,
+          version: ver,
+          file: rel,
           line: indexToLine(text, idx),
           handler: guessHandlerName(text, idx),
-          description: extractNearbyDescription(text, idx),
-          contentType: contentTypeFromNearby(text, idx),
-          requestBodySample: sample,
+          description: swag.description || extractNearbyComment(text, idx),
+          contentType: swag.contentType || contentTypeFromNearby(text, idx),
+          requestBodySample: sample
         });
       }
     }
   }
 }
 
-// 후처리: path 정규화, 중복 제거(dedup by file+line or method+path+handler)
-const norm = (p) => (p || '').replace(/\/+/g, '/').replace(/\/$/, '') || '/';
-const keySet = new Set();
-const deduped = [];
+// ---------- 3) 정규화 & 중복 제거 ----------
+const seen = new Set();
+const out = [];
 for (const e of endpoints) {
-  e.path = norm(e.path);
-  const k = `${e.framework}|${e.method}|${e.path}|${e.file}|${e.line}|${e.handler}`;
-  if (keySet.has(k)) continue;
-  keySet.add(k);
-  deduped.push(e);
+  const k = `${e.framework}|${e.method}|${e.path}|${e.file}|${e.line}`;
+  if (seen.has(k)) continue;
+  seen.add(k);
+  out.push(e);
 }
 
 // 저장
 const outPath = path.join(root, '.api-scan.json');
-fs.writeFileSync(outPath, JSON.stringify(deduped, null, 2));
-console.log(`Found ${deduped.length} endpoints -> ${outPath}`);
+fs.writeFileSync(outPath, JSON.stringify(out, null, 2));
+console.log(`Found ${out.length} endpoints -> ${outPath}`);
