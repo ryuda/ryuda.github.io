@@ -1,28 +1,22 @@
 // tools/scan-apis.mjs
-// 목적: 엔드포인트 스캔 + Swagger 설명 + v1/v2 버전 + RequestBody는 오직 @RequestBody 타입의 클래스(파일)에서만 생성
-// 환경: Node (ESM), 외부 라이브러리 없음
+// 목표: Spring 프로젝트의 HTTP 엔드포인트를 스캔하고,
+//  - version (경로 맨 앞 v1/v2 등)
+//  - Swagger 설명(@Operation/@ApiOperation 우선)
+//  - requestBodySample: 오직 @RequestBody 타입의 DTO/Model 파일 내용만으로 생성
+//  - requestBodySchema: DTO 메타(필수/설명/enum/format/example)
+// 을 .api-scan.json에 저장
+//
+// 환경: Node (ESM), Windows 11 가정, 외부 라이브러리 없음.
 
 import fs from 'fs';
 import path from 'path';
 
 const root = process.cwd();
 const SRC_DIRS = ['src', 'src/main/java', 'src/main/kotlin'];
-const TARGET_EXTS = new Set(['.java', '.kt', '.js', '.ts', '.jsx', '.tsx']); // js/ts는 엔드포인트 탐지/Swagger 설명에만 사용
+const TARGET_EXTS = new Set(['.java', '.kt']); // 스프링 위주. 필요 시 추가
+const MAX_DEPTH = 3;
 
-// -------- 샘플 값 매핑 --------
-const typeSample = (t) => {
-  const s = (t || '').toLowerCase();
-  if (/(^|[\W_])(int|long|double|float|number)([\W_]|$)/.test(s)) return 0;
-  if (/bool|boolean/.test(s)) return true;
-  if (/date|localdate|localdatetime|instant|zoneddatetime/.test(s)) return '2025-01-01T00:00:00Z';
-  if (/uuid/.test(s)) return '00000000-0000-0000-0000-000000000000';
-  if (/byte\[\]|bytes/.test(s)) return '';
-  if (/^string$|char|text/.test(s)) return 'string';
-  if (/list|array|\[\]$/.test(s)) return [];
-  if (/map/.test(s)) return {};
-  return 'string';
-};
-
+// ---------- 유틸 ----------
 const normPath = (p) => (p || '').replace(/\/+/g, '/').replace(/\/$/, '') || '/';
 const extractVersion = (p) => {
   const m = /^\/?(v\d+)\b/i.exec(p || '');
@@ -31,7 +25,6 @@ const extractVersion = (p) => {
 const readText = (f) => { try { return fs.readFileSync(f, 'utf8'); } catch { return ''; } };
 const indexToLine = (text, idx) => text.slice(0, idx).split('\n').length;
 
-// -------- 파일 수집 --------
 const walk = (dir, out = []) => {
   if (!fs.existsSync(dir)) return out;
   for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -45,133 +38,304 @@ const walk = (dir, out = []) => {
   }
   return out;
 };
-const allFiles = SRC_DIRS.flatMap((d) => walk(path.join(root, d)));
 
-// -------- 클래스 인덱스 (Spring DTO/POJO/Kotlin data class) --------
+// ---------- 타입/예시 헬퍼 ----------
+const primitiveSample = (t) => {
+  const s = (t || '').toLowerCase();
+  if (/(^|[\W_])(int|long|double|float|number|bigdecimal)([\W_]|$)/.test(s)) return 0;
+  if (/bool|boolean/.test(s)) return true;
+  if (/date|localdate|localdatetime|instant|zoneddatetime|offsetdatetime/.test(s)) return '2025-01-01T00:00:00Z';
+  if (/uuid/.test(s)) return '00000000-0000-0000-0000-000000000000';
+  if (/byte\[\]|bytes/.test(s)) return '';
+  if (/string|char|text/i.test(s)) return 'string';
+  return 'string';
+};
+const primitiveFormat = (t) => {
+  const s = (t || '').toLowerCase();
+  if (/uuid/.test(s)) return 'uuid';
+  if (/date|time|instant|zoneddatetime|offsetdatetime/i.test(s)) return 'date-time';
+  if (/email/.test(s)) return 'email';
+  return undefined;
+};
+
+// ---------- 클래스/필드 파싱 인덱스 ----------
 /**
- * classIndex: Map<className, {fields:[{name,type}], file}>
- * - Java: "class Xxx { private Type name; }"
- * - Kotlin: "data class Xxx(val name: Type, ...)" 또는 일반 class 필드
+ * classIndex: Map<className, {
+ *   kind: 'class'|'enum',
+ *   file: string,
+ *   fields?: [{ name, type, nullable, annotations: string[], schemaDesc?, schemaExample?, jsonName? }],
+ *   enumValues?: string[]
+ * }>
  */
 const classIndex = new Map();
 
-const parseJavaClasses = (text, file) => {
-  // public class Foo { ... }
-  const classRe = /\bclass\s+([A-Za-z0-9_]+)\s*(?:extends\s+[^{]+)?\s*(?:implements\s+[^{]+)?\s*\{([\s\S]*?)\}/g;
-  for (const m of text.matchAll(classRe)) {
+const parseJava = (text, file) => {
+  // enum
+  for (const m of text.matchAll(/\benum\s+([A-Za-z0-9_]+)\s*\{([\s\S]*?)\}/g)) {
+    const name = m[1];
+    const body = m[2];
+    // 값들: FOO, BAR(1), BAZ
+    const values = (body.split('\n')[0] || '')
+      .split(',')
+      .map(v => v.trim())
+      .filter(v => /^[A-Z0-9_]+(\s*\(.*\))?$/.test(v))
+      .map(v => v.replace(/\(.*\)/, '').trim());
+    classIndex.set(name, { kind: 'enum', file, enumValues: values });
+  }
+
+  // class
+  for (const m of text.matchAll(/\bclass\s+([A-Za-z0-9_]+)\s*(?:extends\s+[^{]+)?\s*(?:implements\s+[^{]+)?\s*\{([\s\S]*?)\}/g)) {
     const name = m[1];
     const body = m[2];
     const fields = [];
 
-    // private Type name;
-    const fieldRe = /(private|protected|public)\s+([A-Za-z0-9_<>\[\]., ?]+)\s+([A-Za-z0-9_]+)\s*;/g;
-    for (const fm of body.matchAll(fieldRe)) {
-      const type = fm[2].replace(/\s+/g, ' ').trim();
-      const fname = fm[3].trim();
-      fields.push({ name: fname, type });
+    // 필드 블록 내에서 줄 단위로 주석/어노테이션/필드 포착
+    const lines = body.split('\n');
+    let annos = [];
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+
+      // 어노테이션 누적
+      const a = line.match(/^@([A-Za-z0-9_.]+)(\((.*)\))?/);
+      if (a) { annos.push(line); continue; }
+
+      // private Type name;  (제네릭/배열 포함)
+      const f = line.match(/(private|protected|public)\s+([A-Za-z0-9_<>\[\]., ?]+)\s+([A-Za-z0-9_]+)\s*;/);
+      if (f) {
+        const type = f[2].replace(/\s+/g, ' ').trim();
+        const name = f[3].trim();
+
+        // 파생 메타
+        let schemaDesc, schemaExample, jsonName, nullable = true;
+
+        // 필요한 어노테이션 해석
+        for (const an of annos) {
+          if (/NotNull|NotBlank/i.test(an)) nullable = false;
+          const sdesc = an.match(/@Schema\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
+          if (sdesc) schemaDesc = sdesc[1].trim();
+          const sex = an.match(/@Schema\s*\(\s*[^)]*example\s*=\s*"(.*?)"/s);
+          if (sex) schemaExample = sex[1].trim();
+          const jn = an.match(/@JsonProperty\s*\(\s*"(.*?)"\s*\)/);
+          if (jn) jsonName = jn[1].trim();
+          if (/Email/i.test(an)) schemaDesc = schemaDesc || 'email';
+          const fmt = an.match(/@JsonFormat\s*\(\s*[^)]*pattern\s*=\s*"(.*?)"/);
+          if (fmt) schemaDesc = schemaDesc || `format: ${fmt[1]}`;
+        }
+
+        fields.push({ name, type, nullable, annotations: [...annos], schemaDesc, schemaExample, jsonName });
+        annos = [];
+      }
     }
 
-    // Lombok @Data 등은 필드 선언만 있으면 위에서 잡힘
-    if (fields.length) classIndex.set(name, { fields, file });
+    if (fields.length || classIndex.has(name)) {
+      classIndex.set(name, { kind: 'class', file, fields });
+    }
   }
 };
 
-const parseKotlinClasses = (text, file) => {
-  // data class Foo(val name: String, val age: Int)
-  const dataRe = /\bdata\s+class\s+([A-Za-z0-9_]+)\s*\(([\s\S]*?)\)/g;
-  for (const m of text.matchAll(dataRe)) {
+const parseKotlin = (text, file) => {
+  // enum class Foo { A, B, C }
+  for (const m of text.matchAll(/\benum\s+class\s+([A-Za-z0-9_]+)\s*\{([\s\S]*?)\}/g)) {
+    const name = m[1];
+    const body = m[2];
+    const values = (body.split('\n')[0] || '')
+      .split(',')
+      .map(v => v.trim())
+      .filter(v => /^[A-Z0-9_]+$/.test(v));
+    classIndex.set(name, { kind: 'enum', file, enumValues: values });
+  }
+
+  // data class Foo(@field:NotNull val name: String, val age: Int?)
+  for (const m of text.matchAll(/\bdata\s+class\s+([A-Za-z0-9_]+)\s*\(([\s\S]*?)\)/g)) {
     const name = m[1];
     const params = m[2];
     const fields = [];
-    // val foo: String, var bar: Int?
-    const pRe = /(val|var)\s+([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_<>,?.\[\]]+)/g;
-    for (const pm of params.matchAll(pRe)) {
-      fields.push({ name: pm[2], type: pm[3].trim() });
+    for (const pm of params.matchAll(/(@[A-Za-z0-9_:.() ,"=]*\s*)?(val|var)\s+([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_<>,?.\[\]]+)(\s*=\s*[^,)]*)?/g)) {
+      const rawAnno = (pm[1] || '').trim();
+      const fname = pm[3];
+      const ftype = pm[4].trim();
+      const hasQ = /\?$/.test(ftype);
+      let schemaDesc, schemaExample, jsonName;
+      let nullable = hasQ;
+
+      if (/NotNull|NotBlank/i.test(rawAnno)) nullable = false;
+      const sdesc = rawAnno.match(/@Schema\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
+      if (sdesc) schemaDesc = sdesc[1].trim();
+      const sex = rawAnno.match(/@Schema\s*\(\s*[^)]*example\s*=\s*"(.*?)"/s);
+      if (sex) schemaExample = sex[1].trim();
+      const jn = rawAnno.match(/@JsonProperty\s*\(\s*"(.*?)"\s*\)/);
+      if (jn) jsonName = jn[1].trim();
+
+      fields.push({ name: fname, type: ftype, nullable, annotations: rawAnno ? [rawAnno] : [], schemaDesc, schemaExample, jsonName });
     }
-    if (fields.length) classIndex.set(name, { fields, file });
+    classIndex.set(name, { kind: 'class', file, fields });
   }
 
-  // 일반 class { val foo: String = ... }
-  const classRe = /\bclass\s+([A-Za-z0-9_]+)\s*(?:\((?:[\s\S]*?)\))?\s*\{([\s\S]*?)\}/g;
-  for (const m of text.matchAll(classRe)) {
+  // 일반 class { val foo: String ... }
+  for (const m of text.matchAll(/\bclass\s+([A-Za-z0-9_]+)\s*(?:\((?:[\s\S]*?)\))?\s*\{([\s\S]*?)\}/g)) {
     const name = m[1];
     const body = m[2];
     const fields = [];
-    const fRe = /\b(val|var)\s+([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_<>,?.\[\]]+)/g;
-    for (const fm of body.matchAll(fRe)) {
-      fields.push({ name: fm[2], type: fm[3].trim() });
+    let lastAnno = [];
+    for (const fm of body.matchAll(/^\s*(@[A-Za-z0-9_:.() ,"=]+)\s*$|^\s*(val|var)\s+([A-Za-z0-9_]+)\s*:\s*([A-Za-z0-9_<>,?.\[\]]+)/gm)) {
+      if (fm[1]) {
+        lastAnno.push(fm[1]);
+        continue;
+      }
+      const fname = fm[3];
+      const ftype = fm[4].trim();
+      const hasQ = /\?$/.test(ftype);
+      let schemaDesc, schemaExample, jsonName;
+      let nullable = hasQ;
+      const rawAnno = lastAnno.join(' '); lastAnno = [];
+
+      if (/NotNull|NotBlank/i.test(rawAnno)) nullable = false;
+      const sdesc = rawAnno.match(/@Schema\s*\(\s*[^)]*description\s*=\s*"(.*?)"/s);
+      if (sdesc) schemaDesc = sdesc[1].trim();
+      const sex = rawAnno.match(/@Schema\s*\(\s*[^)]*example\s*=\s*"(.*?)"/s);
+      if (sex) schemaExample = sex[1].trim();
+      const jn = rawAnno.match(/@JsonProperty\s*\(\s*"(.*?)"\s*\)/);
+      if (jn) jsonName = jn[1].trim();
+
+      fields.push({ name: fname, type: ftype, nullable, annotations: rawAnno ? [rawAnno] : [], schemaDesc, schemaExample, jsonName });
     }
-    if (fields.length) classIndex.set(name, { fields, file });
+    if (fields.length) classIndex.set(name, { kind: 'class', file, fields });
   }
 };
 
-// 인덱싱 실행
-for (const f of allFiles) {
-  const ext = path.extname(f);
-  const text = readText(f);
-  if (ext === '.java') parseJavaClasses(text, f);
-  if (ext === '.kt') parseKotlinClasses(text, f);
-}
+// ---------- 타입 해석 & 스키마/샘플 생성 ----------
+const GENERIC_RE = /([A-Za-z0-9_$.]+)\s*<\s*([A-Za-z0-9_<>,?.\[\] $.]+)\s*>/;
 
-// -------- 타입 → 샘플 객체 생성 (재귀, 제네릭/배열 처리) --------
-const GENERIC_RE = /([A-Za-z0-9_]+)\s*<\s*([A-Za-z0-9_<>,?\[\]. ]+)\s*>/;
+const resolveToSchemaAndSample = (rawType, depth = 0) => {
+  if (!rawType) return [{ type: 'string' }, 'string'];
+  if (depth > MAX_DEPTH) return [{ type: 'object' }, {}];
 
-const resolveTypeToSample = (rawType, depth = 0) => {
-  if (depth > 3) return {}; // 너무 깊으면 중단
-
-  let t = (rawType || '').trim();
-  t = t.replace(/\?$/,''); // Kotlin nullable
+  let t = rawType.trim().replace(/\s+/g, ' ');
   // 배열/리스트
   if (/\[\]$/.test(t)) {
-    const base = t.replace(/\[\]$/,'').trim();
-    return [resolveTypeToSample(base, depth + 1)];
+    const base = t.replace(/\[\]$/, '').trim();
+    const [itemSchema, itemSample] = resolveToSchemaAndSample(base, depth + 1);
+    return [{ type: 'array', items: itemSchema }, [itemSample]];
   }
   if (/^(List|Array|MutableList|Set|Collection)\b/i.test(t)) {
     const gm = t.match(GENERIC_RE);
     const arg = gm ? gm[2].split(',')[0].trim() : 'string';
-    return [resolveTypeToSample(arg, depth + 1)];
+    const [itemSchema, itemSample] = resolveToSchemaAndSample(arg, depth + 1);
+    return [{ type: 'array', items: itemSchema }, [itemSample]];
   }
   if (/^Map\b/i.test(t)) {
-    return {};
+    return [{ type: 'object', additionalProperties: true }, {}];
   }
 
-  // 제네릭 타입 Foo<Bar>
+  // 제네릭 Foo<Bar>
   const gm = t.match(GENERIC_RE);
   if (gm) {
-    const outer = gm[1];
+    const outer = stripPkg(gm[1]);
     const inner = gm[2].split(',')[0].trim();
-    // List<Foo> 같은 건 위에서 처리됨. 나머지는 outer 자체를 DTO로 시도한 뒤 실패 시 inner로 시도
     const dto = classIndex.get(outer);
-    if (dto) return objectFromClass(dto, depth + 1);
-    return resolveTypeToSample(inner, depth + 1);
+    if (dto) {
+      return fromClass(dto, depth + 1);
+    }
+    return resolveToSchemaAndSample(inner, depth + 1);
   }
 
-  // 원시/표준
-  const prim = typeSample(t);
-  if (prim !== 'string' || /^string$/i.test(t)) return prim;
+  // 패키지 경로 제거(java.lang.String → String)
+  t = stripPkg(t);
+
+  // enum
+  const enumHit = classIndex.get(t);
+  if (enumHit && enumHit.kind === 'enum') {
+    const schema = { type: 'string', enum: enumHit.enumValues || [] };
+    const sample = (enumHit.enumValues && enumHit.enumValues[0]) || 'ENUM';
+    return [schema, sample];
+  }
 
   // DTO/POJO
   const dto = classIndex.get(t);
-  if (dto) return objectFromClass(dto, depth + 1);
-
-  // 패키지 경로가 포함된 타입(java.lang.String 등) → 마지막 토큰 재시도
-  if (t.includes('.')) {
-    const last = t.split('.').pop();
-    if (classIndex.has(last)) return objectFromClass(classIndex.get(last), depth + 1);
+  if (dto && dto.kind === 'class') {
+    return fromClass(dto, depth + 1);
   }
 
+  // 원시
+  const base = primitiveSample(t);
+  const fmt = primitiveFormat(t);
+  const schema = { type: typeof base === 'number' ? 'number' : (typeof base === 'boolean' ? 'boolean' : 'string') };
+  if (fmt) schema.format = fmt;
+  return [schema, base];
+};
+
+const stripPkg = (t) => t.includes('.') ? t.split('.').pop() : t;
+
+const fromClass = (dto, depth) => {
+  const properties = {};
+  const required = [];
+  for (const f of (dto.fields || [])) {
+    const name = f.jsonName || f.name;
+    const [sch, sample] = resolveToSchemaAndSample(f.type, depth + 1);
+
+    // 필드 메타 merge
+    if (f.schemaDesc) sch.description = (sch.description ? (sch.description + ' ') : '') + f.schemaDesc;
+    const fmt = primitiveFormat(f.type);
+    if (fmt && !sch.format) sch.format = fmt;
+
+    if (f.schemaExample) {
+      const ex = coerceExample(f.schemaExample, sch);
+      if (ex !== undefined) sch.example = ex;
+    }
+
+    properties[name] = sch;
+    if (!f.nullable) required.push(name);
+  }
+
+  const schema = { type: 'object', properties };
+  if (required.length) schema.required = required;
+
+  // 샘플 생성: example 우선, 없으면 기본값
+  const sample = {};
+  for (const [k, sch] of Object.entries(properties)) {
+    if (sch.example !== undefined) sample[k] = sch.example;
+    else sample[k] = sampleFromSchema(sch);
+  }
+  return [schema, sample];
+};
+
+const coerceExample = (raw, schema) => {
+  if (raw === undefined) return undefined;
+  try {
+    if (schema.type === 'number') return Number(raw);
+    if (schema.type === 'boolean') return /^(true|1)$/i.test(raw);
+    if (schema.type === 'array') {
+      // 콤마 분할 or JSON
+      if (raw.trim().startsWith('[')) return JSON.parse(raw);
+      return [raw];
+    }
+    if (schema.type === 'object') {
+      if (raw.trim().startsWith('{')) return JSON.parse(raw);
+      return undefined;
+    }
+    return raw;
+  } catch { return undefined; }
+};
+
+const sampleFromSchema = (sch) => {
+  if (sch.example !== undefined) return sch.example;
+  if (sch.type === 'number') return 0;
+  if (sch.type === 'boolean') return true;
+  if (sch.type === 'string') {
+    if (sch.format === 'uuid') return '00000000-0000-0000-0000-000000000000';
+    if (sch.format === 'date-time') return '2025-01-01T00:00:00Z';
+    return 'string';
+  }
+  if (sch.type === 'array') return [sampleFromSchema(sch.items || { type: 'string' })];
+  if (sch.type === 'object') {
+    const obj = {};
+    for (const [k, v] of Object.entries(sch.properties || {})) obj[k] = sampleFromSchema(v);
+    return obj;
+  }
   return 'string';
 };
 
-const objectFromClass = (dto, depth) => {
-  const obj = {};
-  for (const f of dto.fields) {
-    obj[f.name] = resolveTypeToSample(f.type, depth + 1);
-  }
-  return obj;
-};
-
-// -------- Swagger 설명 추출 (그대로 유지) --------
+// ---------- Swagger 설명(스프링) ----------
 const extractSwaggerSpring = (text, idx) => {
   const around = text.slice(Math.max(0, idx - 2000), idx + 2000);
   const out = { description: '', contentType: null };
@@ -183,55 +347,32 @@ const extractSwaggerSpring = (text, idx) => {
   if (cons) out.contentType = cons[1].trim();
   const mt = around.match(/mediaType\s*=\s*"(.*?)"/);
   if (!out.contentType && mt) out.contentType = mt[1].trim();
-
-  // swagger-jsdoc 스타일은 Spring에선 거의 없지만, 남겨둠 (무시 가능)
   return out;
 };
 
-// 백업 설명(주석) – Swagger가 없을 때만
-const extractNearbyComment = (text, idx) => {
-  const upToIdx = text.slice(0, idx);
-  const blockIdx = upToIdx.lastIndexOf('/**');
-  const endIdx = upToIdx.lastIndexOf('*/');
-  if (blockIdx !== -1 && endIdx !== -1 && endIdx > blockIdx) {
-    const block = upToIdx.slice(blockIdx, endIdx + 2);
-    const lines = block.split('\n').map((l) => l.replace(/^\s*\/?\**\s?/, '').trim()).filter(Boolean);
-    if (lines.length) return lines.join(' ');
-  }
-  const lines = upToIdx.split('\n');
-  const picked = [];
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const m = lines[i].match(/^\s*\/\/\s?(.*)$/);
-    if (m) picked.unshift(m[1].trim());
-    else break;
-  }
-  return picked.join(' ');
-};
+// ---------- 1) 파일 스캔 & DTO 인덱싱 ----------
+const files = SRC_DIRS.flatMap((d) => walk(path.join(root, d)));
+for (const f of files) {
+  const ext = path.extname(f);
+  const txt = readText(f);
+  if (!txt) continue;
+  if (ext === '.java') parseJava(txt, f);
+  if (ext === '.kt') parseKotlin(txt, f);
+}
 
-const contentTypeFromNearby = (text, idx) => {
-  const around = text.slice(Math.max(0, idx - 1500), idx + 1500);
-  if (/multipart\/form-data/i.test(around)) return 'multipart/form-data';
-  if (/application\/x-www-form-urlencoded/i.test(around)) return 'application/x-www-form-urlencoded';
-  return 'application/json';
-};
-
-// -------- 스캔 결과 --------
+// ---------- 2) 엔드포인트 스캔 (Spring) ----------
 const endpoints = [];
-
-// -------- Spring 엔드포인트 스캔 (RequestBody만 본다) --------
-// CHANGED: RequestBody 샘플 생성 로직을 "오직 @RequestBody 타입"으로 제한
-for (const file of allFiles) {
+for (const file of files) {
   const ext = path.extname(file);
   if (ext !== '.java' && ext !== '.kt') continue;
 
   const text = readText(file);
   if (!text) continue;
   const rel = path.relative(root, file);
-
   const hasCtrl = /@(RestController|Controller)\b/.test(text);
   if (!hasCtrl) continue;
 
-  // 클래스-level @RequestMapping prefix
+  // 클래스 레벨 prefix
   let classPrefix = '';
   const cp =
     [...text.matchAll(/@RequestMapping\s*\(\s*(?:value\s*=\s*)?['"`]([^'"`]+)['"`]\s*\)/g)].pop() ||
@@ -247,27 +388,29 @@ for (const file of allFiles) {
     const version = extractVersion(full);
 
     const swag = extractSwaggerSpring(text, idx);
-    const description = swag.description || extractNearbyComment(text, idx);
-    const contentType = swag.contentType || contentTypeFromNearby(text, idx);
+    const description = swag.description;
+    const contentType = swag.contentType || 'application/json';
 
-    // 메서드 시그니처 근처에서 @RequestBody 타입 찾기 (Java/Kotlin)
-    const after = text.slice(idx, idx + 1000);
-
-    // Java: public Resp create(@RequestBody CreateReq req)
-    // Kotlin: fun create(@RequestBody req: CreateReq)
+    // @RequestBody 타입 추출 (Java/Kotlin)
+    const after = text.slice(idx, idx + 1200);
     let rbType = null;
 
-    const javaRB = after.match(/@RequestBody\s+([A-Za-z0-9_<>$begin:math:display$$end:math:display$.]+)\s+[A-Za-z0-9_]+/);
-    if (javaRB) {
-      rbType = (javaRB[1] || '').replace(/<.*?>/g, '').trim();
-    } else {
-      const ktRB = after.match(/@RequestBody\s+[A-Za-z0-9_]+\s*:\s*([A-Za-z0-9_<>$begin:math:display$$end:math:display$.]+)/);
-      if (ktRB) rbType = (ktRB[1] || '').replace(/<.*?>/g, '').trim();
+    // Java: @RequestBody CreateReq req
+    const javaRB = after.match(/@RequestBody\s+([A-Za-z0-9_<>$begin:math:display$$end:math:display$.$]+)\s+[A-Za-z0-9_]+/);
+    if (javaRB) rbType = javaRB[1].replace(/<.*?>/g, '').trim();
+    // Kotlin: @RequestBody req: CreateReq
+    if (!rbType) {
+      const ktRB = after.match(/@RequestBody\s+[A-Za-z0-9_]+\s*:\s*([A-Za-z0-9_<>$begin:math:display$$end:math:display$.$]+)/);
+      if (ktRB) rbType = ktRB[1].replace(/<.*?>/g, '').trim();
     }
 
+    let requestBodySchema = null;
     let requestBodySample = null;
+
     if (rbType) {
-      requestBodySample = resolveTypeToSample(rbType, 0); // CHANGED: DTO/Zod/Joi/req.body 사용 없음
+      const [sch, sample] = resolveToSchemaAndSample(rbType, 0);
+      requestBodySchema = sch;
+      requestBodySample = sample;
     }
 
     endpoints.push({
@@ -277,15 +420,16 @@ for (const file of allFiles) {
       version,
       file: rel,
       line: indexToLine(text, idx),
-      handler: '',                 // (원하면 메서드명 추출도 추가 가능)
+      handler: '', // 필요 시 함수명 파싱 추가 가능
       description,
       contentType,
+      requestBodySchema,
       requestBodySample
     });
   }
 }
 
-// -------- 중복 제거 & 저장 --------
+// ---------- 3) 중복 제거 & 저장 ----------
 const seen = new Set();
 const out = [];
 for (const e of endpoints) {
